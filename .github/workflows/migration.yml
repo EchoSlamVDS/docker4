@@ -1,0 +1,119 @@
+name: Idempotent Mattermost Migration & Upgrade
+
+on:
+  push:
+    branches: [ "migration" ]
+  workflow_dispatch:
+
+env:
+  COMPOSE_FILE: docker-compose.prod.yml
+
+jobs:
+  migrate-and-deploy:
+    runs-on: self-hosted
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # 1. Проверка идемпотентности
+      - name: Check Migration Status
+        id: check_status
+        run: |
+          if [ -f "$HOME/.mattermost_migration_completed" ]; then
+            echo "✓ Database already migrated. Skipping data transfer."
+            echo "already_migrated=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "⚠ Migration required."
+            echo "already_migrated=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # 2. Бэкап MySQL
+      - name: Backup Legacy MySQL
+        if: steps.check_status.outputs.already_migrated == 'false'
+        run: |
+          echo "⏳ Creating backup of MySQL..."
+          BACKUP_NAME="mattermost_mysql_backup_${{ github.run_id }}.sql"
+          if docker ps | grep -q "mattermost-mysql"; then
+            docker exec mattermost-mysql mysqldump -u mmuser -p"${{ secrets.DB_MYSQL_MMUSER_PASSWORD }}" mattermost > "$BACKUP_NAME"
+            echo "✅ Backup saved as ${BACKUP_NAME}"
+          else
+            echo "❌ Error: Legacy MySQL container is not running!"
+            exit 1
+          fi
+
+      # 3. Запуск чистой PostgreSQL
+      - name: Start Target PostgreSQL
+        if: steps.check_status.outputs.already_migrated == 'false'
+        run: |
+          docker compose -f "${COMPOSE_FILE}" up -d mattermost-postgres
+          sleep 10
+
+      # 4. Миграция pgloader (с include drop)
+      - name: Run pgloader
+        if: steps.check_status.outputs.already_migrated == 'false'
+        run: |
+          echo "⏳ Migrating schema and data..."
+          NETWORK_NAME=$(docker network ls --format '{{.Name}}' | grep mattermost_network | head -n1)
+          # Подключаем MySQL к сети на случай, если он отвалился
+          docker network connect "${NETWORK_NAME}" mattermost-mysql || true
+          
+          docker run --rm --network="${NETWORK_NAME}" \
+            mattermost/mattermost-pgloader:latest \
+            pgloader \
+            --with "include drop" \
+            "mysql://mmuser:${{ secrets.DB_MYSQL_MMUSER_PASSWORD }}@mattermost-mysql:3306/mattermost" \
+            "postgresql://mmuser:${{ secrets.DB_POSTGRES_PASSWORD }}@mattermost-postgres:5432/mattermost"
+
+      # 5. Применение SQL-фиксов (Схемы, Типы, Расширения, Дубликаты миграций)
+      - name: Apply SQL Patches for Mattermost 12 Compatibility
+        if: steps.check_status.outputs.already_migrated == 'false'
+        run: |
+          echo "⏳ Applying compatibility patches..."
+          # Переносим схему mattermost в public, ставим pgcrypto
+          docker exec -i mattermost-postgres psql -U mmuser -d mattermost << 'EOF'
+          DROP SCHEMA public CASCADE;
+          ALTER SCHEMA mattermost RENAME TO public;
+          CREATE EXTENSION IF NOT EXISTS pgcrypto;
+          EOF
+          
+          # Переименовываем типы, которые pgloader создал неправильно
+          docker exec -i mattermost-postgres psql -U mmuser -d mattermost << 'EOF'
+          DO $$
+          BEGIN
+              IF EXISTS (SELECT 1 FROM pg_type WHERE typname = 'channels_type') THEN ALTER TYPE channels_type RENAME TO channel_type; END IF;
+              IF EXISTS (SELECT 1 FROM pg_type WHERE typname = 'teams_type') THEN ALTER TYPE teams_type RENAME TO team_type; END IF;
+              IF EXISTS (SELECT 1 FROM pg_type WHERE typname = 'schemes_scope') THEN ALTER TYPE schemes_scope RENAME TO scheme_scope; END IF;
+              IF EXISTS (SELECT 1 FROM pg_type WHERE typname = 'posts_type') THEN ALTER TYPE posts_type RENAME TO post_type; END IF;
+          END $$;
+          EOF
+          
+          # Удаляем дублирующиеся записи миграций
+          docker exec -i mattermost-postgres psql -U mmuser -d mattermost -c "DELETE FROM db_migrations WHERE version = 92;"
+
+      # 6. Создание флаг-файла
+      - name: Mark Migration as Completed
+        if: steps.check_status.outputs.already_migrated == 'false'
+        run: |
+          touch "$HOME/.mattermost_migration_completed"
+          echo "✅ Migration marked as completed."
+
+      # 7. Запуск Mattermost
+      - name: Deploy Upgraded Stack
+        run: |
+          echo "⏳ Launching Upgraded Mattermost Stack..."
+          docker compose -f "${COMPOSE_FILE}" up -d --build --remove-orphans
+          echo "⏳ Waiting for startup..."
+          sleep 30
+
+      # 8. Health Check
+      - name: Run Health Checks & Verify Data
+        run: |
+          echo "⏳ Running Smoke Tests..."
+          if curl -f http://localhost:8065/api/v4/system/ping; then
+            echo "✅ Mattermost upgraded successfully and running on Postgres!"
+          else
+            echo "❌ Application health check failed. Fetching logs..."
+            docker compose -f "${COMPOSE_FILE}" logs mattermost
+            exit 1
+          fi

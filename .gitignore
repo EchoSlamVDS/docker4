@@ -1,0 +1,6 @@
+*.sql
+*.log
+.DS_Store
+.vscode/
+.idea/
+actions-runner/
